@@ -15,18 +15,21 @@ import pandas as pd
 import seaborn as sns
 sns.set_style('darkgrid')
 
+from sklearn.metrics import classification_report, confusion_matrix
+import seaborn as sns
 import matplotlib.pyplot as plt
 import tensorflow as tf
 from tensorflow import keras
 import tensorflow.image as tfi
-from tensorflow.keras.models import Model, load_model
+from tensorflow.keras.models import Model, load_model, save_model
 from tensorflow.keras.preprocessing.image import load_img, img_to_array
-from tensorflow.keras.layers import Conv2D, MaxPool2D, UpSampling2D, Activation, SeparableConv2D, Conv2DTranspose, MaxPooling2D, concatenate, Layer, Input, Add, Dropout, BatchNormalization, MultiHeadAttention, LayerNormalization, Dense, Dropout
+from tensorflow.keras.layers import Conv2D, MaxPool2D, UpSampling2D,Multiply, Activation, SeparableConv2D, Conv2DTranspose, MaxPooling2D, concatenate, Layer, Input, Add, Dropout, BatchNormalization, MultiHeadAttention, LayerNormalization, Dense, Dropout
 from tensorflow.keras.optimizers import AdamW
 from tensorflow.keras.regularizers import l2
 from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping
 from tensorflow.keras import Sequential, initializers
 from tensorflow.python.framework.convert_to_constants import convert_variables_to_constants_v2
+from sklearn.model_selection import KFold # Import KFold from sklearn.model_selection
 
 from sklearn.metrics import jaccard_score
 import skfuzzy as fuzz
@@ -45,16 +48,6 @@ class FuzzyLayer(Layer):
         b = 0.5  # midpoint
         c = 1.5  # fuzzy scale
         return 1. / (1. + tf.exp(-c * (inputs - b)))
-
-#Fuzzy PostProcessing
-def fuzzy_post_processing(prediction):
-    dfu_fuzzy = fuzz.sigmf(prediction, 0.5, 10)
-    border_fuzzy = fuzz.gaussmf(prediction, 0.3, 0.1)
-    background_fuzzy = fuzz.gaussmf(prediction, 0.1, 0.1)
-
-    combined = dfu_fuzzy * 0.6 + border_fuzzy * 0.3 + background_fuzzy * 0.1
-
-    return combined
 
 #Create Data
 def create_data(data_dir):
@@ -158,7 +151,7 @@ class SmoothingTransformerBlock(Layer):
 
 #Fuzzy Encoder Block
 class FuzzyEncoderBlock(Layer):
-    def __init__(self, filters, kernel_size=3, rate=0.1, pooling=True, **kwargs):
+    def __init__(self, filters, kernel_size=3, rate=0.05, pooling=True, **kwargs):
         super(FuzzyEncoderBlock, self).__init__(**kwargs)
         self.conv1 = Conv2D(filters, kernel_size=kernel_size, padding='same', kernel_regularizer=l2(0.0001))
         self.bn1 = BatchNormalization()
@@ -183,11 +176,47 @@ class FuzzyEncoderBlock(Layer):
 
         return x, inputs
 
+#Attention Gate
+class AttentionGate(Layer):
+    def __init__(self, filters, kernel_size=1, **kwargs):
+        super(AttentionGate, self).__init__(**kwargs)
+        self.W_g = Conv2D(filters, kernel_size=kernel_size, strides=1, padding='same')
+        self.W_x = Conv2D(filters, kernel_size=kernel_size, strides=1, padding='same')
+        self.psi = Conv2D(1, kernel_size=kernel_size, strides=1, padding='same', activation='sigmoid')
+        self.relu = Activation('relu')
+        self.bn = BatchNormalization()
+
+    def call(self, g, x):
+        # g: Decoder feature map
+        # x: Skip connection from Encoder
+        g1 = self.W_g(g)  # Linear transformation on g
+        x1 = self.W_x(x)  # Linear transformation on x
+        psi = self.relu(g1 + x1)  # Add and apply activation
+        psi = self.bn(psi)
+        psi = self.psi(psi)  # Sigmoid to get attention weights
+        return Multiply()([x, psi])  # Apply attention to skip connection
+
+#Loss Function
+def tversky_loss(y_true, y_pred, alpha=0.7, beta=0.3, smooth=1e-6):
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred, tf.float32)
+
+    tp = tf.reduce_sum(y_true * y_pred)
+    fp = tf.reduce_sum((1 - y_true) * y_pred)
+    fn = tf.reduce_sum(y_true * (1 - y_pred))
+
+    tversky_index = (tp + smooth) / (tp + alpha * fp + beta * fn + smooth)
+    return 1 - tversky_index
+
 #Decoder Block
 class DecoderBlock(Layer):
-    def __init__(self, filters, rate=0.1, kernel_size=3, kernel_reg=0.0001, **kwargs):
+    def __init__(self, filters, rate=0.05, kernel_size=3, kernel_reg=0.0001, use_attention_gate=True, **kwargs):
         super(DecoderBlock, self).__init__(**kwargs)
         self.up = Conv2DTranspose(filters, kernel_size=kernel_size, strides=(2, 2), padding='same')
+
+        # Change here: Initialize AttentionGate with the correct number of filters for the skip connection
+        self.attention_gate = AttentionGate(filters) if use_attention_gate else None  # Updated filters to 'filters'
+
         self.conv1 = Conv2D(filters, kernel_size=kernel_size, padding='same', kernel_regularizer=l2(kernel_reg))
         self.bn1 = BatchNormalization()
         self.dropout1 = Dropout(rate)
@@ -196,16 +225,35 @@ class DecoderBlock(Layer):
         self.bn2 = BatchNormalization()
         self.dropout2 = Dropout(rate)
 
+        self.spatial_attention = Conv2D(1, kernel_size=1, activation='sigmoid')
+
     def call(self, inputs, training=False):
         x, skip = inputs
-        x = self.up(x)
+
+        # Apply attention gate if enabled
+        if self.attention_gate:
+            # Adjust the number of filters in 'x' to match 'skip' before applying attention gate
+            # x = Conv2D(skip.shape[-1], kernel_size=1, padding='same')(x)  # Added to adjust filters of 'x' #Removed to upsample x instead
+            x = self.up(x) # Added to upsample x to match the spatial dimension of the skip connection
+            skip = self.attention_gate(x, skip) # Updated
+
+        # Upsample (Moved up for attention gate)
+        #x = self.up(x)
+
+        # Concatenate skip connection
         x = concatenate([x, skip], axis=3)
 
+        # Apply spatial attention
+        attention_weights = self.spatial_attention(x)
+        x = Multiply()([x, attention_weights])
+
+        # First convolution block
         x = self.conv1(x)
         x = self.bn1(x, training=training)
         x = Activation('relu')(x)
         x = self.dropout1(x, training=training)
 
+        # Second convolution block
         x = self.conv2(x)
         x = self.bn2(x, training=training)
         x = Activation('relu')(x)
@@ -302,8 +350,8 @@ import shutil
 from google.colab import drive
 
 drive.mount('/content/drive')
-train_zip_path = '/content/drive/My Drive/UNET/NewDataset/augfusc.zip'
-test_zip_path = '/content/drive/My Drive/UNET/NewDataset/datafusc_test.zip'
+train_zip_path = '/path_to_dataset_train.zip'
+test_zip_path = '/path_to_dataset_test.zip'
 
 with zipfile.ZipFile(train_zip_path, 'r') as zip_ref:
     zip_ref.extractall('dataset/train')
@@ -443,60 +491,244 @@ early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_wei
 reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-7)
 metrics_callback = MetricsCallback(imgs, msks)
 
-#Train Model
-history = model.fit(
-    imgs, msks,
-    validation_split=0.2,
-    epochs=epochs,
-    batch_size=batch_size,
-    verbose=1,
-    callbacks=[metrics_callback, reduce_lr, early_stopping]
-)
+#Training with Cross Validation
+def train_with_cross_validation(imgs, msks, n_splits=5, epochs=150, batch_size=8, save_dir="/pathtosavemodel"):
+    # Buat folder untuk menyimpan model
+    os.makedirs(save_dir, exist_ok=True)
 
-#Save Model
-model.save('unetLiteFuzzyTransFUSC.h5')
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    fold_metrics = {'dice': [], 'iou': [], 'precision': [], 'recall': []}
+    best_dice = 0
+    best_model_path = ""
 
-converter = tf.lite.TFLiteConverter.from_keras_model(model)
-tflite_model = converter.convert()
-with open('unetLiteFuzzyTransFUSC.tflite', 'wb') as f:
-    f.write(tflite_model)
+    for fold, (train_index, val_index) in enumerate(kf.split(imgs)):
+        print(f"Training Fold {fold + 1}/{n_splits}")
 
-plot_training(history)
+        X_train, X_val = imgs[train_index], imgs[val_index]
+        y_train, y_val = msks[train_index], msks[val_index]
 
-#Train Evaluate
+        optimizer = AdamW(learning_rate=0.0001, weight_decay=1e-4)
+        model = create_model(optimizer)
 
-train_metrics = model.evaluate(imgs, msks)
-print(f'Training Loss: {train_metrics[0]}')
-print(f'Dice Coefficient: {train_metrics[1]}')
-print(f'Jaccard Index: {train_metrics[2]}')
-print(f'Precision: {train_metrics[3]}')
-print(f'Recall: {train_metrics[4]}')
+        early_stopping = EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True)
+        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-7)
+        metrics_callback = MetricsCallback(X_val, y_val)
 
-#Load Test
-test_dir = 'dataset/test'
-test_image_paths, test_mask_paths = create_data(test_dir)
+        start_time = time.time()
+        history = model.fit(
+            imgs,  # Input images
+            msks,  # Ground truth masks
+            validation_split=0.2,  # 20% data digunakan untuk validasi
+            epochs=epochs,
+            batch_size=batch_size,
+            verbose=1,  # Menampilkan progress training
+            callbacks=[early_stopping, reduce_lr, metrics_callback]
+        )
+        end_time = time.time()
+        training_time = end_time - start_time
+        print(f"Training time for fold {fold + 1}: {training_time:.2f} seconds")
 
-test_images = load_images(test_image_paths, mask=False, grayscale=False)
-test_masks = load_images(test_mask_paths, mask=True)
+        # Predict on validation set
+        y_pred = model.predict(X_val)
+        y_pred_binary = (y_pred >= 0.5).astype(int)
 
-#Model Test Evaluate
-test_metrics = model.evaluate(test_images, test_masks)
-print(f'Test Loss: {test_metrics[0]}')
-print(f'Dice Coefficient: {test_metrics[1]}')
-print(f'Jaccard Index: {test_metrics[2]}')
-print(f'Precision: {test_metrics[3]}')
-print(f'Recall: {test_metrics[4]}')
+        # Calculate metrics
+        dice = dice_coefficient(y_val, y_pred_binary)
+        iou = jaccard_index(y_val, y_pred_binary)
+        precision_val = precision(y_val, y_pred_binary)
+        recall_val = recall(y_val, y_pred_binary)
 
-#Display Feature Maps
+        # Append metrics to results
+        fold_metrics['dice'].append(dice)
+        fold_metrics['iou'].append(iou)
+        fold_metrics['precision'].append(precision_val)
+        fold_metrics['recall'].append(recall_val)
+
+        print(f"Fold {fold + 1} - Dice: {dice:.4f}, IoU: {iou:.4f}, Precision: {precision_val:.4f}, Recall: {recall_val:.4f}")
+
+        # Save model for this fold
+        fold_model_path = os.path.join(save_dir, f"model_fold_{fold + 1}.h5")
+        save_model(model, fold_model_path)
+        print(f"Model for fold {fold + 1} saved at {fold_model_path}")
+
+        # Check if this is the best model
+        if dice > best_dice:
+            best_dice = dice
+            best_model_path = os.path.join(save_dir, "best_model.h5")
+            save_model(model, best_model_path)
+            print(f"Best model updated with Dice: {best_dice:.4f}")
+
+    return fold_metrics, best_model_path
+
+# Example usage (replace imgs, msks with your actual data)
+fold_metrics, best_model_path = train_with_cross_validation(imgs, msks)
+
+# Calculate mean and standard deviation
+mean_metrics = {key: np.mean(values) for key, values in fold_metrics.items()}
+std_metrics = {key: np.std(values) for key, values in fold_metrics.items()}
+
+# Print results
+print("\nCross-Validation Results:")
+for metric in fold_metrics.keys():
+    print(f"{metric.capitalize()} - Mean: {mean_metrics[metric]:.4f}, Std: {std_metrics[metric]:.4f}")
+
+# Visualize metrics across folds
+plt.figure(figsize=(10, 6))
+for metric in fold_metrics.keys():
+    plt.plot(range(1, len(fold_metrics[metric]) + 1), fold_metrics[metric], marker='o', label=metric.capitalize())
+
+plt.title("Metrics Across Folds")
+plt.xlabel("Fold")
+plt.ylabel("Score")
+plt.legend()
+plt.grid()
+plt.show()
+
+print(f"\nBest model saved at: {best_model_path}")
+
+
+# Load the best model
+best_model = load_model(best_model_path, custom_objects={'dice_coefficient': dice_coefficient,
+                                                        'jaccard_index': jaccard_index,
+                                                        'precision': precision,
+                                                        'recall': recall,
+                                                        'tversky_loss': tversky_loss,
+                                                        'AttentionGate': AttentionGate,
+                                                        'DecoderBlock': DecoderBlock,
+                                                        'FuzzyLayer': FuzzyLayer,
+                                                        'FuzzyEncoderBlock': FuzzyEncoderBlock,  # Add FuzzyEncoderBlock
+                                                        'SmoothingTransformerBlock': SmoothingTransformerBlock}) # Add SmoothingTransformerBlock
+
+# Assuming you have your test data loaded as X_test and y_test
+# Replace 'X_test' and 'y_test' with your actual test data
+test_dir = '/content/dataset/test'
+X_test, y_test = create_data(test_dir)
+X_test = load_images(X_test, mask=False, grayscale=False)
+y_test = load_images(y_test, mask=True)
+
+# Predict on test data
+y_pred = best_model.predict(X_test)
+y_pred_thresholded = (y_pred > 0.7).astype(int)
+
+# Evaluate the model
+loss, dice, iou, precision_test, recall_test = best_model.evaluate(X_test, y_test, verbose=0)
+
+print(f"Test Loss: {loss:.4f}")
+print(f"Test Dice Coefficient: {dice:.4f}")
+print(f"Test IoU: {iou:.4f}")
+print(f"Test Precision: {precision_test:.4f}")
+print(f"Test Recall: {recall_test:.4f}")
+
+#Test with Test Dataset
+def plot_predictions(X_test, y_test, y_pred):
+    n_images = len(X_test)  # Number of images to display
+
+    plt.figure(figsize=(20, 10 * n_images))
+    for i in range(n_images):
+        # Original Image
+        plt.subplot(n_images, 4, i * 4 + 1)
+        plt.imshow(X_test[i])
+        plt.title(f"Original Image {i + 1}")
+        plt.axis('off')
+
+        # Original Mask
+        plt.subplot(n_images, 4, i * 4 + 2)
+        plt.imshow(np.squeeze(y_test[i]), cmap='gray')
+        plt.title(f"Original Mask {i + 1}")
+        plt.axis('off')
+
+        # Predicted Mask
+        plt.subplot(n_images, 4, i * 4 + 3)
+        plt.imshow(np.squeeze(y_pred[i]), cmap='gray')
+        plt.title(f"Predicted Mask {i + 1}")
+        plt.axis('off')
+
+        # Overlay
+        overlay = np.zeros_like(X_test[i])
+        overlay[:, :, 0] = np.squeeze(y_pred[i]) * 255 # Red channel for predicted mask
+        overlay = cv2.addWeighted(X_test[i], 0.5, overlay, 0.5, 0) # Overlay on original image
+        plt.subplot(n_images, 4, i * 4 + 4)
+        plt.imshow(overlay)
+        plt.title(f"Overlay {i+1}")
+        plt.axis('off')
+    plt.show()
+
+# Call the function to display the results
+plot_predictions(X_test, y_test, y_pred_thresholded)
+
+
+#Check Error Prediction
+def plot_low_dice_predictions(X_test, y_test, y_pred, threshold=0.7, num_images=5):
+    # Calculate Dice coefficients for each prediction
+    dice_scores = []
+    for i in range(len(y_test)):
+      dice_scores.append(dice_coefficient(y_test[i], y_pred[i]))
+
+    # Find indices of images with Dice coefficients below the threshold
+    low_dice_indices = np.argsort(dice_scores)[:num_images]
+
+    plt.figure(figsize=(20, 10 * num_images))
+    for i, index in enumerate(low_dice_indices):
+        # Original Image
+        plt.subplot(num_images, 4, i * 4 + 1)
+        plt.imshow(X_test[index])
+        plt.title(f"Original Image {index + 1} (Dice: {dice_scores[index]:.4f})")
+        plt.axis('off')
+
+        # Original Mask
+        plt.subplot(num_images, 4, i * 4 + 2)
+        plt.imshow(np.squeeze(y_test[index]), cmap='gray')
+        plt.title(f"Original Mask {index + 1}")
+        plt.axis('off')
+
+        # Predicted Mask
+        plt.subplot(num_images, 4, i * 4 + 3)
+        plt.imshow(np.squeeze(y_pred[index]), cmap='gray')
+        plt.title(f"Predicted Mask {index + 1}")
+        plt.axis('off')
+
+        # Overlay
+        overlay = np.zeros_like(X_test[index])
+        overlay[:, :, 0] = np.squeeze(y_pred[index]) * 255  # Red channel for predicted mask
+        overlay = cv2.addWeighted(X_test[index], 0.5, overlay, 0.5, 0)  # Overlay on original image
+        plt.subplot(num_images, 4, i * 4 + 4)
+        plt.imshow(overlay)
+        plt.title(f"Overlay {index + 1}")
+        plt.axis('off')
+
+    plt.show()
+
+
+# Example usage:
+plot_low_dice_predictions(X_test, y_test, y_pred_thresholded)
+
+
+#Generate Feature Maps
+model = load_model(best_model_path, custom_objects={
+    'dice_coefficient': dice_coefficient,
+    'jaccard_index': jaccard_index,
+    'precision': precision,
+    'recall': recall,
+    'tversky_loss': tversky_loss,
+    'AttentionGate': AttentionGate,
+    'DecoderBlock': DecoderBlock,
+    'FuzzyLayer': FuzzyLayer,
+    'FuzzyEncoderBlock': FuzzyEncoderBlock,
+    'SmoothingTransformerBlock': SmoothingTransformerBlock
+})
+
+# Visualisasi Feature Maps
 # Get a list of all layer names
 layer_names = [layer.name for layer in model.layers]
 
-# Choose a different image index to display feature maps for
-image_index_to_display = 8  # Change this to the desired image index
+# Choose an image index to display feature maps for
+image_index_to_display = 46  # Change this to the desired image index
 
-# Create a figure with 2 rows for displaying feature maps and the original image
-num_rows = 3  # 2 rows for feature maps and 1 for original image
+# Define the number of rows and columns for the figure
+num_rows = 3  # 2 rows for feature maps and 1 for the original image
 num_cols = int(np.ceil(len(layer_names) / (num_rows - 1)))
+
+# Create the figure
 plt.figure(figsize=(20, 15))  # Adjust figure size as needed
 
 # Display the original image
@@ -505,34 +737,53 @@ plt.imshow(imgs[image_index_to_display])
 plt.title("Original Image", fontsize=10)
 plt.axis('off')
 
-
+# Iterate through each layer to visualize feature maps
 for i, layer_name in enumerate(layer_names):
     try:
-        # Create a new model that outputs the activations of the chosen layer
+        # Create a model that outputs the activations of the chosen layer
         intermediate_layer_model = Model(inputs=model.input, outputs=model.get_layer(layer_name).output)
 
-        # Get the feature maps for the chosen image
+        # Prepare the image and get the feature maps
         image = np.expand_dims(imgs[image_index_to_display], axis=0)  # Add batch dimension
         feature_maps = intermediate_layer_model.predict(image)
 
-        # Check if feature_maps is a list and handle it
+        # Handle cases where feature_maps is a list
         if isinstance(feature_maps, list):
-            # Assuming you want the first element of the list (adjust if needed)
-            feature_maps = feature_maps[0]
+            feature_maps = feature_maps[0]  # Use the first element of the list
 
-        # Visualize the feature maps
-        print(f"Feature maps for layer: {layer_name}")
-        print(feature_maps.shape)  # Check the shape of the feature maps
-
-        # Example of visualizing the first feature map of each layer
-        if feature_maps.shape[-1] > 0:  # Check if there are any feature maps
+        # Visualize the first feature map if it exists
+        if feature_maps.shape[-1] > 0:
             plt.subplot(num_rows, num_cols, i + 2)  # Subplot starting from index 2
             plt.imshow(feature_maps[0, :, :, 0], cmap='gray')  # Display the first feature map
-            plt.title(layer_name, fontsize=10)  # Set font size for the title
+            plt.title(layer_name, fontsize=10)  # Set the title for each layer
             plt.axis('off')
 
     except Exception as e:
         print(f"Error processing layer {layer_name}: {e}")
 
-plt.tight_layout()  # Ensure that subplots don't overlap
+# Adjust layout to prevent overlap
+plt.tight_layout()
 plt.show()
+
+#Get Inference Time
+inference_times = []
+resized_test_images = []
+
+for img in test_images:
+  # Resize the image
+  resized_img = cv2.resize(img, (224, 224))
+  resized_test_images.append(resized_img)
+
+resized_test_images = np.array(resized_test_images)
+
+for i in range(len(resized_test_images)):
+    start_time = time.time()
+    # Perform inference
+    model.predict(np.expand_dims(resized_test_images[i], axis=0))
+    end_time = time.time()
+    inference_time = end_time - start_time
+    inference_times.append(inference_time)
+
+# Calculate and print the average inference time
+avg_inference_time = sum(inference_times) / len(inference_times)
+print(f"Average inference time: {avg_inference_time:.4f} seconds")
